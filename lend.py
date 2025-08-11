@@ -88,10 +88,10 @@ def safe_float(x: Any, default: float = 0.0) -> float:
 
 def autodetect_symbols_from_wallets(rows):
     global ASSET_CODE, SYMBOL
-    seen = set()
+    seen_codes = set()
     for w in rows:
         if isinstance(w, list) and len(w) >= 2:
-            code = str(w).upper()
+            code = str(w[1]).upper()  # Assuming currency code is at index 1
             seen_codes.add(code)
     if "USDT" in seen_codes:
         ASSET_CODE = "USDT"
