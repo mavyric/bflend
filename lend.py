@@ -1,45 +1,57 @@
 #!/usr/bin/env python3
+"""
+Bitfinex USDT Lending Bot — mid-price anchor with LAST_PRICE lean and spread
+
+Public funding ticker: GET https://api-pub.bitfinex.com/v2/tickers?symbols=fUST
+Private submit: POST /v2/auth/w/funding/offer/submit
+Cancel open offers: POST /v2/auth/w/funding/offer/cancel/all
+Wallets: POST /v2/auth/r/wallets
+Signing: HMAC-SHA384 over "/api/" + path + nonce + raw_body
+"""
+
 import os
 import time
 import hmac
 import hashlib
 import json
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, List
 
 import requests
 
-# -------- Config --------
+# ---------- Config ----------
 
 API_KEY = os.getenv("BFX_KEY", "")
 API_SECRET = os.getenv("BFX_SEC", "")
-# Wallet currency for balance/cancel scope will be auto-detected as UST or USDT
+# Wallet currency autodetected (UST or USDT) for balance/cancel
 ASSET_CODE = "UST"
-# Public market endpoints: use fUST to avoid 404s on fUST in some routes
-MARKET_SYMBOL_PUBLIC = "fUST"
-# Private submit: try fUST first; on error, retry once with fUST
+# Public funding ticker symbol (as per your spec)
+PUBLIC_TICKERS_URL = "https://api-pub.bitfinex.com/v2/tickers?symbols=fUST"
+# Private submission symbols: prefer fUST (per your note)
 SYMBOL_PREFERRED = "fUST"
-SYMBOL_FALLBACK = "fUST"
+SYMBOL_FALLBACK = "fUSDT"  # retry once with fUSDT if exchange expects that
 
 MIN_OFFER = 150.0
 CHUNK_SIZE = 1000.0
 DURATION_D = 2
 AUTORENEW = True
 
-# Small symmetric spread around last matched rate (bps/day = 0.0001)
-SPREAD_OFFSETS = [-0.0005, -0.0003, -0.0001, 0.0, 0.0001, 0.0003, 0.0005]
-# Optional APY guard (informational only)
-MIN_APY_GUARD = float(os.getenv("MIN_APY_GUARD", "0"))
-IDLE_WARN_THRESHOLD = 200.0
+# Blend weights: anchor = w_mid * mid + w_last * LAST_PRICE (w_mid + w_last = 1)
+W_MID = 0.7
+W_LAST = 0.3
 
+# Spread ladder (daily rate offsets) around the blended anchor, in decimals (bps/day = 0.0001)
+# Slightly tighter negative side to improve fill, moderate positive side for profitability
+SPREAD_OFFSETS = [-0.0005, -0.0003, -0.0002, 0.0, 0.0002, 0.0004, 0.0006]
+
+IDLE_WARN_THRESHOLD = 200.0
 BASE_URL = "https://api.bitfinex.com"
 
-# -------- Utilities --------
+# ---------- Utilities ----------
 
 def _nonce() -> str:
     return str(int(time.time() * 1000))
 
 def _sign_headers(path_no_slash: str, raw_body: str, nonce: str) -> Dict[str, str]:
-    # Signature = HMAC_SHA384(secret, "/api/" + path + nonce + raw_body)
     sig_str = "/api/" + path_no_slash + nonce + raw_body
     signature = hmac.new(API_SECRET.encode("utf-8"), sig_str.encode("utf-8"), hashlib.sha384).hexdigest()
     return {
@@ -60,12 +72,6 @@ def _post_private(path_no_slash: str, body: Dict[str, Any]) -> Any:
     r.raise_for_status()
     return r.json()
 
-def _get_public(path_with_leading_slash: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    url = BASE_URL + path_with_leading_slash
-    r = requests.get(url, params=params or {}, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
 def daily_to_apy(d: float) -> float:
     return (1.0 + d) ** 365 - 1.0
 
@@ -78,15 +84,16 @@ def safe_float(x: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
-# -------- Wallet & symbols --------
+# ---------- Wallets / Cancel ----------
 
 def autodetect_wallet_currency(rows: List[List[Any]]) -> None:
     global ASSET_CODE
     seen = set()
     for w in rows:
         try:
-            code = str(w[1]).upper() if len(w) > 1 else str(w).upper()
-            seen.add(code)
+            # Expect [WALLET_TYPE, CURRENCY, BALANCE, UNCONF, AVAILABLE, ...]
+            if isinstance(w, list) and len(w) >= 2:
+                seen.add(str(w[1]).upper())
         except Exception:
             continue
     if "USDT" in seen:
@@ -123,86 +130,64 @@ def cancel_all_usdt_offers() -> None:
     except Exception as e:
         print("Cancel-all error:", e)
 
-# -------- Market data (public) --------
+# ---------- Public ticker anchor ----------
 
-def funding_best_bid_ask() -> Tuple[Optional[float], Optional[float]]:
-    try:
-        # /v2/book/funding/{symbol}/R0 returns [RATE, PERIOD, COUNT, AMOUNT] rows for funding
-        book = _get_public(f"/v2/book/funding/{MARKET_SYMBOL_PUBLIC}/R0", params={"len": 25})
-        bids, asks = [], []
-        for row in book:
-            if isinstance(row, list) and len(row) >= 4:
-                rate = safe_float(row[0])
-                amount = safe_float(row[3])
-                if amount > 0:
-                    bids.append(rate)
-                elif amount < 0:
-                    asks.append(rate)
-        best_bid = max(bids) if bids else None
-        best_ask = min(asks) if asks else None
-        return best_bid, best_ask
-    except Exception as e:
-        print("Book fetch error:", e)
-        return None, None
-
-def fetch_last_matched_daily_rate() -> Optional[float]:
+def fetch_funding_ticker_fust() -> Optional[List[Any]]:
     """
-    Latest matched funding trade rate:
-    GET /v2/trades/funding/{symbol}/hist?limit=1 → [[ID, MTS, AMOUNT, RATE, PERIOD]] for funding.
+    GET https://api-pub.bitfinex.com/v2/tickers?symbols=fUST
+    Funding tickers array-of-arrays; for fUST row, fields (docs):
+    [ SYMBOL, FRR, BID, BID_PERIOD, BID_SIZE, ASK, ASK_PERIOD, ASK_SIZE,
+      DAILY_CHANGE, DAILY_CHANGE_PERC, LAST_PRICE, VOLUME, HIGH, LOW, ... ]
     """
     try:
-        trades = _get_public(f"/v2/trades/funding/{MARKET_SYMBOL_PUBLIC}/hist", params={"limit": 1, "sort": -1})
-        if isinstance(trades, list) and trades:
-            row = trades[0]
-            if isinstance(row, list) and len(row) >= 5:
-                rate = safe_float(row[3], 0.0)
-                if rate > 0:
-                    return rate
+        r = requests.get(PUBLIC_TICKERS_URL, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        # Return the fUST row if present (first row)
+        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
+            return data[0]
     except Exception as e:
-        print("Last matched fetch error:", e)
+        print("Public ticker fetch error:", e)
     return None
 
-def fetch_frr_daily_rate() -> float:
-    # Public funding stats "last" for FRR and related values; use the main rate as a fallback anchor
+def derive_anchor_rate_from_ticker(row: List[Any]) -> Optional[float]:
+    # Safely parse BID, ASK, LAST_PRICE by documented indices
     try:
-        data = _get_public(f"/v2/funding/stats/{MARKET_SYMBOL_PUBLIC}/last")
-        # Docs vary; accept scalar or [MTS, VALUE]
-        if isinstance(data, list):
-            if len(data) >= 2:
-                val = safe_float(data[1], 0.0)
-                if val > 0:
-                    return val
-            elif len(data) == 1:
-                val = safe_float(data[0], 0.0)
-                if val > 0:
-                    return val
+        # Indices per provided schema (funding ticker)
+        # SYMBOL, FRR, BID, BID_PERIOD, BID_SIZE, ASK, ASK_PERIOD, ASK_SIZE, DAILY_CHANGE, DAILY_CHANGE_PERC, LAST_PRICE, ...
+        bid = safe_float(row[2], 0.0)
+        ask = safe_float(row[5], 0.0)
+        last = safe_float(row[10], 0.0)
+        # Require valid bid/ask to form mid; if one side missing, fallback to the other
+        if bid > 0 and ask > 0:
+            mid = 0.5 * (bid + ask)
+        elif bid > 0:
+            mid = bid
+        elif ask > 0:
+            mid = ask
         else:
-            val = safe_float(data, 0.0)
-            if val > 0:
-                return val
-    except Exception as e:
-        print("FRR fetch error:", e)
-    best_bid, best_ask = funding_best_bid_ask()
-    if best_bid and best_ask:
-        return (best_bid + best_ask) / 2.0
-    return max(best_bid or 0.0002, 0.0002)
+            # If both missing, but last>0, use last as anchor; else None
+            return last if last > 0 else None
+        # Blend toward LAST_PRICE slightly for responsiveness
+        anchor = max(W_MID * mid + W_LAST * last, 0.000001)
+        return anchor
+    except Exception:
+        return None
 
-# -------- Submissions (private) --------
+# ---------- Submissions ----------
 
 def submit_offer_with_symbol(amount: float, rate: float, period: int, oftype: str, flags: int, symbol: str) -> Any:
-    # POST /v2/auth/w/funding/offer/submit
     body = {
         "type": oftype,  # "LIMIT" or "FRRDELTA"
-        "symbol": symbol,  # fUST (preferred) or fUST (fallback)
+        "symbol": symbol,  # fUST preferred per user spec
         "amount": f"{amount:.6f}",
-        "rate": f"{rate:.6f}",
+        "rate": f"{rate:.6f}",  # daily rate
         "period": period,
         "flags": flags,
     }
     return _post_private("v2/auth/w/funding/offer/submit", body)
 
 def submit_offer(amount: float, rate: float, period: int, oftype: str, flags: int = 0) -> Any:
-    # Try preferred symbol first; on error retry with fallback once
     try:
         return submit_offer_with_symbol(amount, rate, period, oftype, flags, SYMBOL_PREFERRED)
     except Exception as e1:
@@ -212,12 +197,12 @@ def submit_offer(amount: float, rate: float, period: int, oftype: str, flags: in
 def auto_renew_flag() -> int:
     return 1024 if AUTORENEW else 0
 
-# -------- Strategy --------
+# ---------- Strategy ----------
 
-def place_limit_offers_around_last_rate(free_bal: float, last_rate: float) -> float:
+def place_spread_offers_around_anchor(free_bal: float, anchor_rate: float) -> float:
     """
-    Split all available funds into $1000 chunks and place LIMIT offers at:
-    last_rate * (1 + offset), cycling offsets round-robin.
+    Split all funds into $1000 chunks and place LIMIT offers at anchor*(1+offset).
+    Negative offsets likely fill faster; positive offsets improve yield.
     """
     flags = auto_renew_flag()
     remaining = free_bal
@@ -227,12 +212,13 @@ def place_limit_offers_around_last_rate(free_bal: float, last_rate: float) -> fl
         if amt < MIN_OFFER:
             break
         offset = SPREAD_OFFSETS[idx % len(SPREAD_OFFSETS)]
-        target_rate = max(last_rate * (1.0 + offset), 0.000001)
+        target = max(anchor_rate * (1.0 + offset), 0.000001)
         try:
-            resp = submit_offer(amt, target_rate, DURATION_D, "LIMIT", flags)
+            resp = submit_offer(amt, target, DURATION_D, "LIMIT", flags)
             print(
-                f"LIMIT chunk {idx+1}: amount={amt:.2f} rate={target_rate:.6f} "
-                f"(offset {offset:+.4f}), APY~{apy_to_str(daily_to_apy(target_rate))} -> {resp}"
+                f"LIMIT chunk {idx+1}: amount={amt:.2f} rate={target:.6f} "
+                f"(anchor {anchor_rate:.6f}, offset {offset:+.4f}), "
+                f"APY~{apy_to_str(daily_to_apy(target))} -> {resp}"
             )
             remaining -= amt
             idx += 1
@@ -242,56 +228,56 @@ def place_limit_offers_around_last_rate(free_bal: float, last_rate: float) -> fl
     return remaining
 
 def main():
-    print("---- Bitfinex USDT Lending Bot ----")
+    print("---- Bitfinex USDT Lending Bot (mid+last anchor, spread) ----")
 
-    # 1) Cancel stale offers
+    # 1) Cancel stale offers (best-effort)
     cancel_all_usdt_offers()
 
-    # 2) Free balance
+    # 2) Free balance and wallet currency
     free_bal = get_free_usdt_balance()
-    print(f"Using wallet currency: {ASSET_CODE} | public market symbol: {MARKET_SYMBOL_PUBLIC}")
+    print(f"Wallet currency detected: {ASSET_CODE}")
     print(f"Free USDT (funding wallet): {free_bal:.2f}")
     if free_bal < MIN_OFFER:
         print("Nothing to lend (below minimum offer).")
         return
 
-    # 3) Anchor: latest matched funding trade rate; fallback to FRR/book
-    last_rate = fetch_last_matched_daily_rate()
-    if last_rate:
-        print(f"Last matched daily rate: {last_rate:.6f} ({apy_to_str(daily_to_apy(last_rate))})")
-    else:
-        last_rate = fetch_frr_daily_rate()
-        print(f"Using fallback daily rate: {last_rate:.6f} ({apy_to_str(daily_to_apy(last_rate))})")
+    # 3) Fetch funding ticker for fUST and derive anchor rate
+    row = fetch_funding_ticker_fust()
+    anchor = None
+    if row:
+        anchor = derive_anchor_rate_from_ticker(row)
+        # Also log FRR, BID, ASK, LAST for visibility
+        frr = safe_float(row[1], 0.0)
+        bid = safe_float(row[2], 0.0)
+        ask = safe_float(row[5], 0.0)
+        last = safe_float(row[10], 0.0)
+        print(
+            f"Ticker fUST: FRR={frr:.6f}, BID={bid:.6f}, ASK={ask:.6f}, "
+            f"LAST={last:.6f}"
+        )
+    if not anchor or anchor <= 0:
+        print("Warning: Could not derive anchor from ticker; aborting to avoid bad quotes.")
+        return
+    print(f"Anchor daily rate (blend mid→last): {anchor:.6f} ({apy_to_str(daily_to_apy(anchor))})")
 
-    if MIN_APY_GUARD > 0:
-        apy = daily_to_apy(last_rate) * 100
-        if apy < MIN_APY_GUARD:
-            print(f"Warning: Last-rate APY {apy:.2f}% below guard {MIN_APY_GUARD:.2f}%. Proceeding with placement around last rate.")
+    # 4) Place spread LIMIT offers around the anchor
+    remaining = place_spread_offers_around_anchor(free_bal, anchor)
 
-    # 4) Place multiple $1000 LIMIT offers around last rate
-    remaining = place_limit_offers_around_last_rate(free_bal, last_rate)
-
-    # 5) Final sweep: any leftover >=150 goes exactly at last_rate
+    # 5) Final sweep: any leftover ≥$150 at exact anchor
     if remaining >= MIN_OFFER:
         flags = auto_renew_flag()
         amt = remaining
         try:
-            resp = submit_offer(amt, max(last_rate, 0.000001), DURATION_D, "LIMIT", flags)
-            print(f"Final sweep LIMIT: amount={amt:.2f} rate={last_rate:.6f} -> {resp}")
+            resp = submit_offer(amt, max(anchor, 0.000001), DURATION_D, "LIMIT", flags)
+            print(f"Final sweep LIMIT: amount={amt:.2f} rate={anchor:.6f} -> {resp}")
             remaining = 0.0
         except Exception as e:
             print(f"Final sweep error: {e}")
 
     if remaining >= IDLE_WARN_THRESHOLD:
-        print("Warning:", f"{remaining:.2f} USDT still idle. Consider adjusting SPREAD_OFFSETS or CHUNK_SIZE.")
+        print("Warning:", f"{remaining:.2f} USDT still idle. Consider widening SPREAD_OFFSETS or reducing CHUNK_SIZE.")
 
     print("Run complete.")
 
 if __name__ == "__main__":
     main()
-
-# Notes:
-# - Latest matched rate source: /v2/trades/funding/fUST/hist returns funding trades as [ID, MTS, AMOUNT, RATE, PERIOD].
-# - FRR fallback: /v2/funding/stats/fUST/last or book mid from /v2/book/funding/fUST/R0 when needed.
-# - Submissions: /v2/auth/w/funding/offer/submit expects LIMIT or FRRDELTA; we use LIMIT with daily rate decimals (e.g., 0.0005=5bps/day).
-# - Auth signing follows Bitfinex v2 rules; private endpoints all use POST with raw JSON body and “/api/” prefix in the signature string.
