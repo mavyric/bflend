@@ -86,16 +86,17 @@ def safe_float(x: Any, default: float = 0.0) -> float:
 
 # ---------------- Bitfinex helpers ----------------
 
-def autodetect_symbols_from_wallets(rows: List[List[Any]]) -> None:
+def autodetect_symbols_from_wallets(rows):
     global ASSET_CODE, SYMBOL
     seen = set()
     for w in rows:
         if isinstance(w, list) and len(w) >= 2:
-            seen.add(w[1])
-    if "USDT" in seen:
+            code = str(w).upper()
+            seen_codes.add(code)
+    if "USDT" in seen_codes:
         ASSET_CODE = "USDT"
         SYMBOL = "fUSDT"
-    elif "UST" in seen:
+    elif "UST" in seen_codes:
         ASSET_CODE = "UST"
         SYMBOL = "fUST"
 
@@ -104,12 +105,19 @@ def get_free_usdt_balance() -> float:
         resp = _post_private("v2/auth/r/wallets", {})
         free = 0.0
         valid_rows = [w for w in resp if isinstance(w, list) and len(w) >= 5]
-        if valid_rows:
-            autodetect_symbols_from_wallets(valid_rows)
-            for w in valid_rows:
-                wtype, currency, _, _, available = w
+        # Detect USDT/UST from whatever appears in wallets
+        autodetect_symbols_from_wallets(valid_rows)
+        # TYPE=w, CURRENCY=w, AVAILABLE=w per docs
+        for w in valid_rows:
+            try:
+                wtype = str(w[0]).lower()   # Assuming type is at index 0
+                currency = str(w[1]).upper()  # Assuming currency is at index 1
+                available = safe_float(w[2], 0.0)  # Assuming available is at index 2
                 if wtype == "funding" and currency == ASSET_CODE:
-                    free = max(free, safe_float(available, 0.0))
+                    # Use max in case there are multiple wallet rows
+                    free = max(free, available)
+            except Exception:
+                continue
         return free
     except Exception as e:
         print("Balance fetch error:", e)
