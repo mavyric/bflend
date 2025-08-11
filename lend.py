@@ -14,10 +14,10 @@ API_KEY = os.getenv("BFX_KEY", "")
 API_SECRET = os.getenv("BFX_SEC", "")
 # Wallet currency for balance/cancel scope will be auto-detected as UST or USDT
 ASSET_CODE = "UST"
-# Public market endpoints: use fUSDT to avoid 404s on fUST in some routes
-MARKET_SYMBOL_PUBLIC = "fUSDT"
-# Private submit: try fUSDT first; on error, retry once with fUST
-SYMBOL_PREFERRED = "fUSDT"
+# Public market endpoints: use fUST to avoid 404s on fUST in some routes
+MARKET_SYMBOL_PUBLIC = "fUST"
+# Private submit: try fUST first; on error, retry once with fUST
+SYMBOL_PREFERRED = "fUST"
 SYMBOL_FALLBACK = "fUST"
 
 MIN_OFFER = 150.0
@@ -193,7 +193,7 @@ def submit_offer_with_symbol(amount: float, rate: float, period: int, oftype: st
     # POST /v2/auth/w/funding/offer/submit
     body = {
         "type": oftype,  # "LIMIT" or "FRRDELTA"
-        "symbol": symbol,  # fUSDT (preferred) or fUST (fallback)
+        "symbol": symbol,  # fUST (preferred) or fUST (fallback)
         "amount": f"{amount:.6f}",
         "rate": f"{rate:.6f}",
         "period": period,
@@ -291,7 +291,7 @@ if __name__ == "__main__":
     main()
 
 # Notes:
-# - Latest matched rate source: /v2/trades/funding/fUSDT/hist returns funding trades as [ID, MTS, AMOUNT, RATE, PERIOD].
-# - FRR fallback: /v2/funding/stats/fUSDT/last or book mid from /v2/book/funding/fUSDT/R0 when needed.
+# - Latest matched rate source: /v2/trades/funding/fUST/hist returns funding trades as [ID, MTS, AMOUNT, RATE, PERIOD].
+# - FRR fallback: /v2/funding/stats/fUST/last or book mid from /v2/book/funding/fUST/R0 when needed.
 # - Submissions: /v2/auth/w/funding/offer/submit expects LIMIT or FRRDELTA; we use LIMIT with daily rate decimals (e.g., 0.0005=5bps/day).
 # - Auth signing follows Bitfinex v2 rules; private endpoints all use POST with raw JSON body and “/api/” prefix in the signature string.
