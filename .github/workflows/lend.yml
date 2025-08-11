@@ -1,23 +1,28 @@
 name: Bitfinex-USDT-Lender
+
 on:
-schedule:
-- cron: "*/15 * * * *"
-workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
 jobs:
-lend:
-runs-on: ubuntu-latest
-timeout-minutes: 5
-steps:
-- uses: actions/checkout@v4
-- name: Set up Python
-uses: actions/setup-python@v5
-with:
-python-version: "3.11"
-- name: Install deps
-run: pip install -r requirements.txt
-- name: Run lending bot
-env:
-BFX_KEY: ${{ secrets.BFX_KEY }}
-BFX_SEC: ${{ secrets.BFX_SEC }}
-MIN_APY_GUARD: "5" # optional, e.g. require >=5% APY
-run: python lend.py
+  lend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run lending bot
+        env:
+          BFX_KEY: ${{ secrets.BFX_KEY }}
+          BFX_SEC: ${{ secrets.BFX_SEC }}
+          MIN_APY_GUARD: "5" # optional, e.g. require >=5% APY
+        run: python lend.py
