@@ -52,7 +52,6 @@ X-BFX-APIKEY, X-BFX-PAYLOAD (raw JSON), X-BFX-SIGNATURE (HMAC SHA384)
 if not API_KEY or not API_SECRET:
 raise RuntimeError("Missing API credentials: set BFX_KEY and BFX_SEC")
 
-text
 j = json.dumps(body)
 sig = f"/api{path}{j}{body['nonce']}"
 h = hmac.new(API_SECRET.encode(), sig.encode(), hashlib.sha384).hexdigest()
@@ -135,7 +134,6 @@ return frr
 except Exception as e:
 print("FRR fetch error:", e)
 
-text
 # Fallback: estimate from top-of-book
 best_bid, best_ask = funding_best_bid_ask()
 if best_bid and best_ask:
@@ -191,7 +189,6 @@ flags = auto_renew_flag()
 remaining = free_bal
 placed = 0
 
-text
 # Determine whether to restrict to one FRR=0 leg due to low APY
 base_apy = daily_to_apy(base_frr) if base_frr > 0 else 0.0
 low_env = (min_apy_guard > 0 and base_apy*100 < min_apy_guard)
@@ -226,7 +223,6 @@ return remaining
 if remaining < MIN_OFFER:
 return remaining
 
-text
 flags = auto_renew_flag()
 chunks = min(MAKER_CHUNKS, int(remaining // CHUNK_SIZE))
 if chunks <= 0:
@@ -259,7 +255,6 @@ print("---- Bitfinex USDT Lending Bot (serverless) ----")
 # 1) Cancel stale offers
 cancel_all_usdt_offers()
 
-text
 # 2) Check free balance
 free_bal = get_free_usdt_balance()
 print(f"Free USDT (funding wallet): {free_bal:.2f}")
