@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 """
-Bitfinex USDT Lending Bot — mid-price anchor with LAST_PRICE lean and spread
+Bitfinex USDT Lending Bot — mid-price anchor with LAST_PRICE lean, spread,
+deadband re-quoting, and book-aware laddering.
+
+Strategy per tick:
+  * Derive an anchor daily rate = 70% mid(BID,ASK) + 30% LAST_PRICE from the
+    public funding ticker (fUST).
+  * Net-APY floor: skip NEW lending when post-fee yield < MIN_APY_GUARD.
+  * Book-aware ladder: if ask-side depth (sum of 25 lowest ask sizes) is thin,
+    quote only at/above the anchor (no yield sacrifice into a crowded book).
+  * Deadband: keep existing offers (price-time queue position) unless the
+    anchor moved beyond REQUOTE_DEADBAND_FRAC of its own size; only then
+    cancel-all and re-place.
 
 Public funding ticker: GET https://api-pub.bitfinex.com/v2/tickers?symbols=fUST
 Private submit: POST /v2/auth/w/funding/offer/submit
 Cancel open offers: POST /v2/auth/w/funding/offer/cancel/all
+Active offers: POST /v2/auth/r/funding/offers/{symbol}
 Wallets: POST /v2/auth/r/wallets
 Signing: HMAC-SHA384 over "/api/" + path + nonce + raw_body
 """
@@ -46,9 +58,19 @@ SPREAD_OFFSETS = [-0.0005, -0.0003, -0.0002, 0.0, 0.0002, 0.0004, 0.0006]
 
 IDLE_WARN_THRESHOLD = 200.0
 BASE_URL = "https://api.bitfinex.com"
-# Optional APY floor in percent: if set (e.g. MIN_APY_GUARD=5), skip lending
-# when the blended anchor's annualized yield is below this.
+# Optional APY floor in percent (NET of exchange fee): if set (e.g.
+# MIN_APY_GUARD=5), skip lending when the net anchor yield is below this.
 MIN_APY_GUARD = float(os.getenv("MIN_APY_GUARD") or 0.0)
+# Bitfinex fee on lender interest: 15% standard (18% for hidden offers).
+FEE_RATE = 0.15
+# Deadband re-quoting: skip cancel+re-place unless every active offer has
+# drifted more than this fraction of the blended anchor away from the closest
+# desired target rate (avoids losing price-time queue position every tick).
+REQUOTE_DEADBAND_FRAC = 0.001
+# Thin ask-side depth threshold (USDt, sum of 25 lowest ask sizes from the
+# ticker). Below this, the ladder drops its negative (yield-sacrificing)
+# offsets and quotes only at/above the anchor.
+ASK_DEPTH_MIN = 25000.0
 
 
 class BitfinexAPIError(Exception):
@@ -103,6 +125,10 @@ def _extract_api_error(data: Any) -> Optional[str]:
 
 def daily_to_apy(d: float) -> float:
     return (1.0 + d) ** 365 - 1.0
+
+def net_daily_to_apy(d: float) -> float:
+    """APY after the exchange fee on earned interest."""
+    return (1.0 + d * (1.0 - FEE_RATE)) ** 365 - 1.0
 
 def apy_to_str(apy: float) -> str:
     return f"{apy*100:.2f}%"
@@ -208,7 +234,74 @@ def derive_anchor_rate_from_ticker(row: List[Any]) -> Optional[float]:
     except Exception:
         return None
 
-# ---------- Submissions ----------
+def ask_depth_usdt(row: List[Any]) -> float:
+    """ASK_SIZE (sum of the 25 lowest ask sizes, in the funding currency)."""
+    return safe_float(row[7], 0.0)
+
+def active_offsets(ask_depth: float) -> List[float]:
+    """
+    Book-aware ladder: with thin ask-side depth, other lenders are quoting
+    aggressively right at the rate, so a negative offset only sacrifices
+    yield to sit in a crowded queue — keep only at/above-anchor levels.
+    """
+    if ask_depth and ask_depth >= ASK_DEPTH_MIN:
+        return SPREAD_OFFSETS
+    return [o for o in SPREAD_OFFSETS if o >= 0.0]
+
+# ---------- Active offers (deadband) ----------
+
+def fetch_active_offers() -> List[Dict[str, Any]]:
+    """
+    POST /v2/auth/r/funding/offers/{symbol}
+    Entry: [0] ID, [4] AMOUNT (remaining), [10] STATUS, [14] RATE, [15] PERIOD.
+    """
+    out: List[Dict[str, Any]] = []
+    for sym in (SYMBOL_PREFERRED, SYMBOL_FALLBACK):
+        try:
+            resp = _post_private(f"v2/auth/r/funding/offers/{sym}", {})
+            if not isinstance(resp, list):
+                continue
+            for o in resp:
+                if not isinstance(o, list) or len(o) < 16:
+                    continue
+                status = str(o[10]).upper()
+                if status not in ("ACTIVE", "PARTIALLY FILLED"):
+                    continue
+                out.append({
+                    "id": o[0],
+                    "symbol": str(o[1]),
+                    "amount": safe_float(o[4], 0.0),
+                    "rate": safe_float(o[14], 0.0),
+                    "period": safe_float(o[15], 0.0),
+                })
+        except Exception as e:
+            print(f"Active-offers fetch error ({sym}): {e}")
+    return out
+
+def requote_needed(offers: List[Dict[str, Any]], targets: List[float]) -> bool:
+    """
+    True unless EVERY active offer sits within
+    anchor * REQUOTE_DEADBAND_FRAC of its nearest desired target rate AND its
+    term matches. Any uncovered rate level (or missing offers) => re-quote.
+    """
+    if not targets:
+        return False
+    if not offers:
+        return True
+    anchor = min(targets) if targets else 0.0
+    tol = anchor * REQUOTE_DEADBAND_FRAC
+    for o in offers:
+        if o["period"] != DURATION_D:
+            return True
+        if o["amount"] < 1.0:
+            return True
+        best = min(abs(o["rate"] - t) for t in targets)
+        if best > tol:
+            return True
+    # Offer levels must not exceed target levels (extra stale levels = churn).
+    if len(offers) > len(targets):
+        return True
+    return False
 
 def submit_offer_with_symbol(amount: float, rate: float, period: int, oftype: str, flags: int, symbol: str) -> Any:
     body = {
@@ -233,7 +326,7 @@ def auto_renew_flag() -> int:
 
 # ---------- Strategy ----------
 
-def place_spread_offers_around_anchor(free_bal: float, anchor_rate: float) -> float:
+def place_spread_offers_around_anchor(free_bal: float, anchor_rate: float, offsets: List[float]) -> float:
     """
     Split all funds into $1000 chunks and place LIMIT offers at anchor*(1+offset).
     Negative offsets likely fill faster; positive offsets improve yield.
@@ -241,11 +334,11 @@ def place_spread_offers_around_anchor(free_bal: float, anchor_rate: float) -> fl
     flags = auto_renew_flag()
     remaining = free_bal
     idx = 0
-    while remaining >= MIN_OFFER:
+    while remaining >= MIN_OFFER and offsets:
         amt = min(CHUNK_SIZE, remaining)
         if amt < MIN_OFFER:
             break
-        offset = SPREAD_OFFSETS[idx % len(SPREAD_OFFSETS)]
+        offset = offsets[idx % len(offsets)]
         target = max(anchor_rate * (1.0 + offset), 0.000001)
         try:
             resp = submit_offer(amt, target, DURATION_D, "LIMIT", flags)
@@ -264,10 +357,7 @@ def place_spread_offers_around_anchor(free_bal: float, anchor_rate: float) -> fl
 def main():
     print("---- Bitfinex USDT Lending Bot (mid+last anchor, spread) ----")
 
-    # 1) Cancel stale offers (best-effort)
-    cancel_all_usdt_offers()
-
-    # 2) Free balance and wallet currency
+    # 1) Free balance and wallet currency (no state changes yet)
     free_bal = get_free_usdt_balance()
     print(f"Wallet currency detected: {ASSET_CODE}")
     print(f"Free USDT (funding wallet): {free_bal:.2f}")
@@ -275,40 +365,69 @@ def main():
         print("Nothing to lend (below minimum offer).")
         return 0
 
-    # 3) Fetch funding ticker for fUST and derive anchor rate
+    # 2) Fetch funding ticker for fUST and derive anchor rate
     row = fetch_funding_ticker_fust()
     anchor = None
+    depth = 0.0
     if row:
         anchor = derive_anchor_rate_from_ticker(row)
-        # Also log FRR, BID, ASK, LAST for visibility
+        depth = ask_depth_usdt(row)
+        # Also log FRR, BID, ASK, ASK_SIZE, LAST for visibility
         frr = safe_float(row[1], 0.0)
         bid = safe_float(row[2], 0.0)
         ask = safe_float(row[5], 0.0)
         last = safe_float(row[10], 0.0)
         print(
             f"Ticker fUST: FRR={frr:.6f}, BID={bid:.6f}, ASK={ask:.6f}, "
-            f"LAST={last:.6f}"
+            f"ASK_SIZE={depth:.0f}, LAST={last:.6f}"
         )
     if not anchor or anchor <= 0:
         print("Warning: Could not derive anchor from ticker; aborting to avoid bad quotes.")
         return 1
-    print(f"Anchor daily rate (blend mid→last): {anchor:.6f} ({apy_to_str(daily_to_apy(anchor))})")
+    print(
+        f"Anchor daily rate (blend mid→last): {anchor:.6f} "
+        f"(gross {apy_to_str(daily_to_apy(anchor))}, net {apy_to_str(net_daily_to_apy(anchor))})"
+    )
 
-    # 3b) APY floor guard: skip lending when the blended anchor yields less
-    # than MIN_APY_GUARD percent (set the MIN_APY_GUARD secret to enable).
+    # 2b) NET APY floor guard: skip NEW lending when the net (post-fee) anchor
+    # yield is below MIN_APY_GUARD percent. Existing offers/loans are left in
+    # place (they keep earning; borrowers can return early).
     if MIN_APY_GUARD > 0:
-        anchor_apy_pct = daily_to_apy(anchor) * 100.0
-        if anchor_apy_pct < MIN_APY_GUARD:
+        anchor_net_apy_pct = net_daily_to_apy(anchor) * 100.0
+        if anchor_net_apy_pct < MIN_APY_GUARD:
+            open_amt = sum(o["amount"] for o in fetch_active_offers())
             print(
-                f"Anchor APY {anchor_apy_pct:.2f}% below guard {MIN_APY_GUARD:.2f}% — "
-                "skipping this cycle (old offers already canceled)."
+                f"Net anchor APY {anchor_net_apy_pct:.2f}% below guard "
+                f"{MIN_APY_GUARD:.2f}% — skipping new lending this cycle "
+                f"({open_amt:.2f} USDT still working on the book)."
             )
             return 0
 
-    # 4) Place spread LIMIT offers around the anchor
-    remaining = place_spread_offers_around_anchor(free_bal, anchor)
+    # 3) Book-aware offsets (thin ask depth => drop the negative side)
+    offsets = active_offsets(depth)
+    print(
+        f"Offsets: {'full ladder' if len(offsets) == len(SPREAD_OFFSETS) else 'thin-depth ladder'} "
+        f"({len(offsets)} levels)"
+    )
+    targets = [max(anchor * (1.0 + o), 0.000001) for o in offsets]
 
-    # 5) Final sweep: any leftover ≥$150 at exact anchor
+    # 4) Deadband: keep the ladder (and its price-time queue position) unless
+    # the desired targets have moved beyond the deadband.
+    offers = fetch_active_offers()
+    if offers:
+        print(
+            f"Active offers: {len(offers)} levels, "
+            f"{sum(o['amount'] for o in offers):.2f} USDT on book"
+        )
+    if not requote_needed(offers, targets):
+        print("Anchor within deadband — keeping existing offers (queue position preserved).")
+        return 0
+
+    # 5) Re-quote: cancel all (hard-fail on error), then re-place
+    cancel_all_usdt_offers()
+    remaining = place_spread_offers_around_anchor(free_bal, anchor, offsets)
+
+    # 6) Final sweep: any leftover ≥$150 at exact anchor
     if remaining >= MIN_OFFER:
         flags = auto_renew_flag()
         amt = remaining
