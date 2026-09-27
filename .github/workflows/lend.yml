@@ -9,6 +9,11 @@ on:
 
 jobs:
   lend:
+    # One run at a time: if the previous run is still going, skip this tick
+    # (a slow run can never be joined by the next 10-minute trigger).
+    concurrency:
+      group: bflend
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -29,7 +34,7 @@ jobs:
         env:
           BFX_KEY: ${{ secrets.BFX_KEY }}
           BFX_SEC: ${{ secrets.BFX_SEC }}
-          # Optional: Uncomment the line below and set a value in your GitHub secrets 
-          # to prevent lending below a certain APY (e.g., "5" for 5%).
-          # MIN_APY_GUARD: ${{ secrets.MIN_APY_GUARD }}
+          # Optional: set a value in your GitHub secrets to prevent lending
+          # below a certain APY (e.g. "5" for 5%). lend.py reads this now.
+          MIN_APY_GUARD: ${{ secrets.MIN_APY_GUARD }}
         run: python lend.py

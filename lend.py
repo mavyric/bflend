@@ -10,6 +10,7 @@ Signing: HMAC-SHA384 over "/api/" + path + nonce + raw_body
 """
 
 import os
+import sys
 import time
 import hmac
 import hashlib
@@ -45,6 +46,13 @@ SPREAD_OFFSETS = [-0.0005, -0.0003, -0.0002, 0.0, 0.0002, 0.0004, 0.0006]
 
 IDLE_WARN_THRESHOLD = 200.0
 BASE_URL = "https://api.bitfinex.com"
+# Optional APY floor in percent: if set (e.g. MIN_APY_GUARD=5), skip lending
+# when the blended anchor's annualized yield is below this.
+MIN_APY_GUARD = float(os.getenv("MIN_APY_GUARD") or 0.0)
+
+
+class BitfinexAPIError(Exception):
+    """API returned an application-level error (often inside an HTTP 200 body)."""
 
 # ---------- Utilities ----------
 
@@ -70,7 +78,28 @@ def _post_private(path_no_slash: str, body: Dict[str, Any]) -> Any:
     url = BASE_URL + "/" + path_no_slash
     r = requests.post(url, data=raw_body, headers=headers, timeout=30)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    # Bitfinex can return HTTP 200 with an application-level error in the body.
+    err = _extract_api_error(data)
+    if err is not None:
+        raise BitfinexAPIError(f"{path_no_slash}: {err}")
+    return data
+
+
+def _extract_api_error(data: Any) -> Optional[str]:
+    """Detect Bitfinex application-level errors that ride inside HTTP 200 bodies."""
+    if isinstance(data, str):
+        s = data.strip()
+        if s.lower().startswith("error") or "exception" in s.lower():
+            return s
+        return None
+    if isinstance(data, dict):
+        for key in ("error", "errors", "code"):
+            if key in data and data[key]:
+                return str(data[key])
+    if isinstance(data, list) and data and isinstance(data[0], (str, dict)) and "error" in str(data[0]).lower():
+        return str(data[0])
+    return None
 
 def daily_to_apy(d: float) -> float:
     return (1.0 + d) ** 365 - 1.0
@@ -112,7 +141,9 @@ def get_free_usdt_balance() -> float:
                 try:
                     wtype = str(w[0]).lower()
                     currency = str(w[1]).upper()
-                    available = safe_float(w[2], 0.0)
+                    # [4] = AVAILABLE_BALANCE (not [2] BALANCE): only funds not
+                    # tied up in open offers/loans may be re-lent.
+                    available = safe_float(w[4], 0.0)
                     if wtype == "funding" and currency == ASSET_CODE:
                         free = max(free, available)
                 except Exception:
@@ -123,12 +154,15 @@ def get_free_usdt_balance() -> float:
         return 0.0
 
 def cancel_all_usdt_offers() -> None:
+    body = {"symbol": ASSET_CODE}
     try:
-        body = {"symbol": ASSET_CODE}
         resp = _post_private("v2/auth/w/funding/offer/cancel/all", body)
         print("Canceled open funding offers:", resp)
     except Exception as e:
-        print("Cancel-all error:", e)
+        # Hard-fail: if stale offers remain, the next round would stack new
+        # offers on top of them (over-lending). Abort this cycle.
+        print(f"Cancel-all failed (aborting cycle to avoid stacking offers): {e}")
+        raise
 
 # ---------- Public ticker anchor ----------
 
@@ -239,7 +273,7 @@ def main():
     print(f"Free USDT (funding wallet): {free_bal:.2f}")
     if free_bal < MIN_OFFER:
         print("Nothing to lend (below minimum offer).")
-        return
+        return 0
 
     # 3) Fetch funding ticker for fUST and derive anchor rate
     row = fetch_funding_ticker_fust()
@@ -257,8 +291,19 @@ def main():
         )
     if not anchor or anchor <= 0:
         print("Warning: Could not derive anchor from ticker; aborting to avoid bad quotes.")
-        return
+        return 1
     print(f"Anchor daily rate (blend mid→last): {anchor:.6f} ({apy_to_str(daily_to_apy(anchor))})")
+
+    # 3b) APY floor guard: skip lending when the blended anchor yields less
+    # than MIN_APY_GUARD percent (set the MIN_APY_GUARD secret to enable).
+    if MIN_APY_GUARD > 0:
+        anchor_apy_pct = daily_to_apy(anchor) * 100.0
+        if anchor_apy_pct < MIN_APY_GUARD:
+            print(
+                f"Anchor APY {anchor_apy_pct:.2f}% below guard {MIN_APY_GUARD:.2f}% — "
+                "skipping this cycle (old offers already canceled)."
+            )
+            return 0
 
     # 4) Place spread LIMIT offers around the anchor
     remaining = place_spread_offers_around_anchor(free_bal, anchor)
@@ -278,6 +323,7 @@ def main():
         print("Warning:", f"{remaining:.2f} USDT still idle. Consider widening SPREAD_OFFSETS or reducing CHUNK_SIZE.")
 
     print("Run complete.")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
