@@ -52,9 +52,14 @@ AUTORENEW = True
 W_MID = 0.7
 W_LAST = 0.3
 
-# Spread ladder (daily rate offsets) around the blended anchor, in decimals (bps/day = 0.0001)
-# Slightly tighter negative side to improve fill, moderate positive side for profitability
-SPREAD_OFFSETS = [-0.0005, -0.0003, -0.0002, 0.0, 0.0002, 0.0004, 0.0006]
+# Spread ladder: ABSOLUTE daily-rate offsets (decimals/day; 0.00002 = 2bp/day
+# ≈ 0.73% APY per step). Absolute on purpose: the previous RELATIVE offsets
+# (±0.0002..0.0006 × anchor) were ~1e-7 against a ~0.0002 anchor — smaller
+# than the 1e-6 rate tick — so every rung rounded onto a single price (proved
+# in live logs: 7 "levels" all submitted at 0.000221). This ladder spans
+# anchor-8bp .. anchor+4bp in 2bp steps: bottom rungs price near the 2-day
+# supply-clearing rate for prompt fills, top rungs wait for funding spikes.
+SPREAD_OFFSETS = [-0.00008, -0.00006, -0.00004, -0.00002, 0.0, 0.00002, 0.00004]
 
 IDLE_WARN_THRESHOLD = 200.0
 BASE_URL = "https://api.bitfinex.com"
@@ -282,18 +287,19 @@ def fetch_active_offers() -> List[Dict[str, Any]]:
             print(f"Active-offers fetch error ({sym}): {e}")
     return out
 
-def requote_needed(offers: List[Dict[str, Any]], targets: List[float]) -> bool:
+def requote_needed(offers: List[Dict[str, Any]], targets: List[float], anchor: float) -> bool:
     """
     True unless EVERY active offer sits within
     anchor * REQUOTE_DEADBAND_FRAC of its nearest desired target rate AND its
     term matches. Any uncovered rate level (or missing offers) => re-quote.
+    Tolerance is relative to the ANCHOR (not min(targets)) so the band keeps
+    the same absolute meaning (-8bp..+4bp) across the whole ladder.
     """
     if not targets:
         return False
     if not offers:
         return True
-    anchor = min(targets) if targets else 0.0
-    tol = anchor * REQUOTE_DEADBAND_FRAC
+    tol = max(anchor, 0.0) * REQUOTE_DEADBAND_FRAC
     for o in offers:
         if o["period"] != DURATION_D:
             return True
@@ -358,7 +364,9 @@ def place_spread_offers_around_anchor(free_bal: float, anchor_rate: float, offse
         if amt < MIN_OFFER:
             break
         offset = offsets[idx % len(offsets)]
-        target = max(anchor_rate * (1.0 + offset), 0.000001)
+        # Absolute offsets: a rung is anchor + offset (decimals/day), NOT a
+        # percentage of the anchor — see SPREAD_OFFSETS comment above.
+        target = max(anchor_rate + offset, 0.000001)
         try:
             resp = submit_offer(amt, target, DURATION_D, "LIMIT", flags)
             print(
@@ -428,7 +436,7 @@ def main():
         f"Offsets: {'full ladder' if len(offsets) == len(SPREAD_OFFSETS) else 'thin-depth ladder'} "
         f"({len(offsets)} levels)"
     )
-    targets = [max(anchor * (1.0 + o), 0.000001) for o in offsets]
+    targets = [max(anchor + o, 0.000001) for o in offsets]
 
     # 4) Deadband: keep the ladder (and its price-time queue position) unless
     # the desired targets have moved beyond the deadband.
@@ -438,7 +446,7 @@ def main():
             f"Active offers: {len(offers)} levels, "
             f"{sum(o['amount'] for o in offers):.2f} USDT on book"
         )
-    if not requote_needed(offers, targets):
+    if not requote_needed(offers, targets, anchor):
         print("Anchor within deadband — keeping existing offers (queue position preserved).")
         return 0
 
