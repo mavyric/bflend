@@ -1,21 +1,35 @@
 name: Bitfinex USDT Lender
 
+# HOURLY CADENCE DESIGN
+# GitHub throttles this repo's cron heavily: the old "*/10" schedule only
+# fired ~every 6h. So the real clock is a SELF-CHAINING run: each run does
+# the lending pass, sleeps ~59 min, then dispatches exactly one successor
+# via workflow_dispatch (dispatched runs are never throttled). A low-rate
+# daily watchdog below re-ignites the chain if the runner dies mid-run
+# (the only way the chain can break). The watchdog may cancel a sleeping
+# run (cancel-in-progress); its bot step already ran, so at worst one
+# extra lending pass per day -- harmless for this idempotent bot.
+
 on:
   schedule:
-    # Runs every 10 minutes
-    - cron: "*/10 * * * *"
+    # Chain-resurrection watchdog only (not the primary clock).
+    - cron: "17 6 * * *"
   workflow_dispatch:
-    # Allows you to run this workflow manually from the Actions tab
+    # Manual run from the Actions tab (also revives the chain).
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   lend:
-    # One run at a time: if the previous run is still going, skip this tick
-    # (a slow run can never be joined by the next 10-minute trigger).
+    # One chain at a time; a watchdog run cancels a sleeping predecessor.
     concurrency:
       group: bflend
       cancel-in-progress: true
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Must cover bot + setup + the ~59m inter-run sleep.
+    timeout-minutes: 75
 
     steps:
       - name: Checkout repository
@@ -38,3 +52,14 @@ jobs:
           # below a certain APY (e.g. "5" for 5%). lend.py reads this now.
           MIN_APY_GUARD: ${{ secrets.MIN_APY_GUARD }}
         run: python lend.py
+
+      - name: Sleep ~59m then dispatch next hourly run
+        # always(): a failed lending pass must NOT break the chain either.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sleep 3540
+          gh api -X POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/lend.yml/dispatches" \
+            -f ref="${GITHUB_REF_NAME}"
