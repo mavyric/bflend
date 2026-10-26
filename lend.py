@@ -63,10 +63,14 @@ BASE_URL = "https://api.bitfinex.com"
 MIN_APY_GUARD = float(os.getenv("MIN_APY_GUARD") or 0.0)
 # Bitfinex fee on lender interest: 15% standard (18% for hidden offers).
 FEE_RATE = 0.15
-# Deadband re-quoting: skip cancel+re-place unless every active offer has
-# drifted more than this fraction of the blended anchor away from the closest
-# desired target rate (avoids losing price-time queue position every tick).
-REQUOTE_DEADBAND_FRAC = 0.001
+# Deadband re-quoting: keep existing offers (price-time queue position)
+# unless any active offer has drifted from the closest desired target rate by
+# more than this fraction of the anchor itself. 0.02 = 2% of anchor: at a
+# 0.0002/day anchor that is ~0.4bp/day — well inside the 2-6bp ladder step,
+# yet wide enough to absorb normal inter-tick anchor jitter. (The old 0.001
+# gave a ~2e-7 tolerance that real markets exceed within seconds, so the
+# band never held and every tick churned.)
+REQUOTE_DEADBAND_FRAC = 0.02
 # Thin ask-side depth threshold (USDt, sum of 25 lowest ask sizes from the
 # ticker). Below this, the ladder drops its negative (yield-sacrificing)
 # offsets and quotes only at/above the anchor.
@@ -357,13 +361,13 @@ def place_spread_offers_around_anchor(free_bal: float, anchor_rate: float, offse
 def main():
     print("---- Bitfinex USDT Lending Bot (mid+last anchor, spread) ----")
 
-    # 1) Free balance and wallet currency (no state changes yet)
+    # 1) Free balance and wallet currency (no state changes yet).
+    # NOTE: this must NOT gate the cycle. A fully-placed book has free ~0 by
+    # design; an early return here used to lock out requoting forever (the
+    # cancel that frees capital lives inside the requote branch below).
     free_bal = get_free_usdt_balance()
     print(f"Wallet currency detected: {ASSET_CODE}")
     print(f"Free USDT (funding wallet): {free_bal:.2f}")
-    if free_bal < MIN_OFFER:
-        print("Nothing to lend (below minimum offer).")
-        return 0
 
     # 2) Fetch funding ticker for fUST and derive anchor rate
     row = fetch_funding_ticker_fust()
@@ -423,8 +427,16 @@ def main():
         print("Anchor within deadband — keeping existing offers (queue position preserved).")
         return 0
 
-    # 5) Re-quote: cancel all (hard-fail on error), then re-place
+    # 5) Re-quote: cancel all (hard-fail on error) FIRST to release the
+    # capital parked in open offers, then re-read the free balance and
+    # re-place. Only funds still out on active loans are genuinely
+    # unavailable at this point.
     cancel_all_usdt_offers()
+    free_bal = max(free_bal, get_free_usdt_balance())
+    print(f"Free USDT after cancel: {free_bal:.2f}")
+    if free_bal < MIN_OFFER:
+        print("Nothing to re-place after cancel (funds are out on active loans).")
+        return 0
     remaining = place_spread_offers_around_anchor(free_bal, anchor, offsets)
 
     # 6) Final sweep: any leftover ≥$150 at exact anchor
