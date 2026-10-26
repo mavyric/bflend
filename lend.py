@@ -316,7 +316,22 @@ def submit_offer_with_symbol(amount: float, rate: float, period: int, oftype: st
         "period": period,
         "flags": flags,
     }
-    return _post_private("v2/auth/w/funding/offer/submit", body)
+    # Bitfinex intermittently answers 5xx under load (observed 2026-10-26:
+    # two 500s mid-ladder, leaving ~$900 idle an hour). Retry transient 5xx
+    # with short backoff; 4xx / app-level errors surface immediately (they
+    # are deterministic: bad nonce, insufficient balance, etc.).
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            return _post_private("v2/auth/w/funding/offer/submit", body)
+        except requests.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status is not None and 500 <= status < 600 and attempt < attempts:
+                wait = 2 * attempt
+                print(f"Submit HTTP {status} (attempt {attempt}/{attempts}); retrying in {wait}s")
+                time.sleep(wait)
+                continue
+            raise
 
 def submit_offer(amount: float, rate: float, period: int, oftype: str, flags: int = 0) -> Any:
     try:

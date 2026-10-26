@@ -63,3 +63,8 @@ jobs:
           gh api -X POST \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/lend.yml/dispatches" \
             -f ref="${GITHUB_REF_NAME}"
+          # Brief grace so this job fully finishes before its successor
+          # starts; otherwise cancel-in-progress marks every run 'cancelled'
+          # during teardown (the successor dispatched by THIS step reaches
+          # 'started' while this job is still posting). Observed 2026-10-26.
+          sleep 45
