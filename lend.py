@@ -23,6 +23,7 @@ Signing: HMAC-SHA384 over "/api/" + path + nonce + raw_body
 
 import os
 import sys
+import math
 import time
 import hmac
 import hashlib
@@ -361,6 +362,11 @@ def place_spread_offers_around_anchor(free_bal: float, anchor_rate: float, offse
     idx = 0
     while remaining >= MIN_OFFER and offsets:
         amt = min(CHUNK_SIZE, remaining)
+        # Bitfinex's fUST submit endpoint answers HTTP 500 for FRACTIONAL
+        # amounts (every fractional tail ever attempted failed: 897.12 in
+        # Sep, 914.47 in Oct; every integer 1000.000000 chunk succeeded).
+        # Floor to whole UST; the sub-UST remainder is dust vs MIN_OFFER.
+        amt = float(math.floor(amt))
         if amt < MIN_OFFER:
             break
         offset = offsets[idx % len(offsets)]
@@ -462,16 +468,18 @@ def main():
         return 0
     remaining = place_spread_offers_around_anchor(free_bal, anchor, offsets)
 
-    # 6) Final sweep: any leftover ≥$150 at exact anchor
+    # 6) Final sweep: any leftover >=$150 at exact anchor (floored to whole
+    # UST — fractional amounts make the fUST endpoint 500, see above)
     if remaining >= MIN_OFFER:
         flags = auto_renew_flag()
-        amt = remaining
-        try:
-            resp = submit_offer(amt, max(anchor, 0.000001), DURATION_D, "LIMIT", flags)
-            print(f"Final sweep LIMIT: amount={amt:.2f} rate={anchor:.6f} -> {resp}")
-            remaining = 0.0
-        except Exception as e:
-            print(f"Final sweep error: {e}")
+        amt = float(math.floor(remaining))
+        if amt >= MIN_OFFER:
+            try:
+                resp = submit_offer(amt, max(anchor, 0.000001), DURATION_D, "LIMIT", flags)
+                print(f"Final sweep LIMIT: amount={amt:.2f} rate={anchor:.6f} -> {resp}")
+                remaining = 0.0
+            except Exception as e:
+                print(f"Final sweep error: {e}")
 
     if remaining >= IDLE_WARN_THRESHOLD:
         print("Warning:", f"{remaining:.2f} USDT still idle. Consider widening SPREAD_OFFSETS or reducing CHUNK_SIZE.")
